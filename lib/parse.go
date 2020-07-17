@@ -23,7 +23,7 @@ func closer(c io.Closer) {
 }
 
 func convertLinks(in <-chan string, client *dualClient) <-chan Link {
-	out := make(chan Link)
+	out := make(chan Link, 10)
 	go func() {
 		for link := range in {
 			resp, err := client.Head(link)
