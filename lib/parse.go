@@ -1,7 +1,6 @@
 package gobot
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"net/url"
@@ -16,44 +15,15 @@ type Link struct {
 	Status bool   `json:"status"`
 }
 
-func closeConn(conn io.Closer) {
-	err := conn.Close()
+func closer(c io.Closer) {
+	err := c.Close()
 	if err != nil {
 		log.Printf("Error: %+v", err)
 	}
 }
 
-// Parses value to retrieve href
-func parseLinks(attributes []html.Attribute) []string {
-	links := make([]string, 0)
-	for i := 0; i < len(attributes); i++ {
-		if attributes[i].Key == "href" {
-			link, err := url.ParseRequestURI(attributes[i].Val)
-			if link == nil || err != nil {
-				continue
-			}
-			if link.Scheme != "" {
-				links = append(links, link.String())
-			}
-		}
-	}
-	return links
-}
-
-func genLinks(links []string) <-chan string {
-	in := make(chan string)
-	go func() {
-		for _, link := range links {
-			in <- link
-		}
-		close(in)
-	}()
-	return in
-}
-
 func convertLinks(in <-chan string, client *dualClient) <-chan Link {
 	out := make(chan Link)
-
 	go func() {
 		for link := range in {
 			resp, err := client.Head(link)
@@ -62,6 +32,28 @@ func convertLinks(in <-chan string, client *dualClient) <-chan Link {
 				Status: err == nil && resp.StatusCode < 400,
 			}
 		}
+		close(out)
+	}()
+	return out
+}
+
+func mergeLinks(chans ...<-chan string) <-chan string {
+	var wg sync.WaitGroup
+	out := make(chan string)
+
+	merge := func(c <-chan string) {
+		for link := range c {
+			out <- link
+		}
+		wg.Done()
+	}
+	wg.Add(len(chans))
+
+	for _, c := range chans {
+		go merge(c)
+	}
+	go func() {
+		wg.Wait()
 		close(out)
 	}()
 	return out
@@ -91,17 +83,68 @@ func mergeConverts(chans ...<-chan Link) <-chan Link {
 	return out
 }
 
-// JobsPerLink ...
-const JobsPerLink = 3
-
-func startConvert(links []string, client *dualClient) <-chan Link {
-	queue := genLinks(links)
-	numJobs := len(links) / JobsPerLink
+func startConverting(linkChan <-chan string, client *dualClient, numJobs int) <-chan Link {
 	jobs := make([]<-chan Link, numJobs)
-	for i := 0; i < numJobs; i++ {
-		jobs[i] = convertLinks(queue, client)
-	}
+	go func() {
+		for i := 0; i < numJobs; i++ {
+			jobs[i] = convertLinks(linkChan, client)
+		}
+	}()
 	return mergeConverts(jobs...)
+}
+
+func parseLinks(attrChan chan html.Attribute) chan string {
+	linkChan := make(chan string, 10)
+	go func() {
+		for attr := range attrChan {
+			if attr.Key == "href" {
+				link, err := url.ParseRequestURI(attr.Val)
+				if link == nil || err != nil {
+					continue
+				}
+				if link.Scheme != "" {
+					linkChan <- link.String()
+				}
+			}
+		}
+		close(linkChan)
+	}()
+	return linkChan
+}
+
+func sendAttrs(attrChan chan html.Attribute, attrs []html.Attribute) {
+	go func() {
+		for _, attr := range attrs {
+			attrChan <- attr
+		}
+	}()
+}
+
+func startParsing(body io.Reader, numJobs int) <-chan string {
+	tokenizer := html.NewTokenizer(body)
+	attrChan := make(chan html.Attribute, 10)
+	parsingJobs := make([]<-chan string, numJobs)
+	go func() {
+		for i := 0; i < numJobs; i-- {
+			parsingJobs[i] = parseLinks(attrChan)
+		}
+	}()
+	go func() {
+		for notEnd := true; notEnd; {
+			currentTokenType := tokenizer.Next()
+			switch {
+			case currentTokenType == html.ErrorToken:
+				notEnd = false
+			case currentTokenType == html.StartTagToken:
+				token := tokenizer.Token()
+				if token.Data == "a" {
+					sendAttrs(attrChan, token.Attr)
+				}
+			}
+		}
+		close(attrChan)
+	}()
+	return mergeLinks(parsingJobs...)
 }
 
 // GetLinks returns a map that contains the links as keys and their statuses as values
@@ -112,31 +155,10 @@ func GetLinks(rootLink string) ([]Link, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer closeConn(resp.Body)
-
-	tokenizer := html.NewTokenizer(resp.Body)
-	links := make([]string, 0)
-	for notEnd := true; notEnd; {
-		currentTokenType := tokenizer.Next()
-		switch {
-		case currentTokenType == html.ErrorToken:
-			notEnd = false
-		case currentTokenType == html.StartTagToken:
-			token := tokenizer.Token()
-			// Parsing and collecting href attribute values from anchor tags
-
-			if token.Data == "a" {
-				links = append(links, parseLinks(token.Attr)...)
-			}
-		}
-	}
-
-	if len(links) == 0 {
-		return nil, fmt.Errorf("no links found for %s", rootLink)
-	}
-
+	defer closer(resp.Body)
+	linkChan := startParsing(resp.Body, 16)
 	linkCollection := make([]Link, 0)
-	for link := range startConvert(links, client) {
+	for link := range startConverting(linkChan, client, 16) {
 		linkCollection = append(linkCollection, link)
 	}
 	return linkCollection, nil
