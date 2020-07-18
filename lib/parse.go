@@ -63,24 +63,10 @@ func parseLinks(attrChan chan html.Attribute) chan string {
 	return linkChan
 }
 
-func sendAttrs(attrChan chan html.Attribute, attrs []html.Attribute) {
+func readAnchorTags(body io.Reader) chan html.Attribute {
+	out := make(chan html.Attribute, 10)
 	go func() {
-		for _, attr := range attrs {
-			attrChan <- attr
-		}
-	}()
-}
-
-func startParsing(body io.Reader, numJobs int) <-chan string {
-	tokenizer := html.NewTokenizer(body)
-	attrChan := make(chan html.Attribute, 10)
-	parsingJobs := make([]<-chan string, numJobs)
-	go func() {
-		for i := 0; i < numJobs; i-- {
-			parsingJobs[i] = parseLinks(attrChan)
-		}
-	}()
-	go func() {
+		tokenizer := html.NewTokenizer(body)
 		for notEnd := true; notEnd; {
 			currentTokenType := tokenizer.Next()
 			switch {
@@ -89,11 +75,24 @@ func startParsing(body io.Reader, numJobs int) <-chan string {
 			case currentTokenType == html.StartTagToken:
 				token := tokenizer.Token()
 				if token.Data == "a" {
-					sendAttrs(attrChan, token.Attr)
+					for _, attr := range token.Attr {
+						out <- attr
+					}
 				}
 			}
 		}
-		close(attrChan)
+		close(out)
+	}()
+	return out
+}
+
+func startParsing(body io.Reader, numJobs int) <-chan string {
+	anchorChan := readAnchorTags(body)
+	parsingJobs := make([]<-chan string, numJobs)
+	go func() {
+		for i := 0; i < numJobs; i-- {
+			parsingJobs[i] = parseLinks(anchorChan)
+		}
 	}()
 	return mergeLinks(parsingJobs...)
 }
