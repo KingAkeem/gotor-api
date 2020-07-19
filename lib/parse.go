@@ -9,9 +9,9 @@ import (
 	"golang.org/x/net/html"
 )
 
-// Link ...
-type Link struct {
-	Name   string `json:"name"`
+// LinkNode ...
+type LinkNode struct {
+	Link   string `json:"link"`
 	Status bool   `json:"status"`
 }
 
@@ -22,20 +22,108 @@ func closer(c io.Closer) {
 	}
 }
 
-func mergeLinks(chans ...<-chan string) <-chan string {
-	var wg sync.WaitGroup
-	out := make(chan string)
+// Replace mutex with atomic switch for perf
+var mux sync.Mutex
 
-	merge := func(c <-chan string) {
-		for link := range c {
-			out <- link
+func sendTokens(tokenizer *html.Tokenizer) chan html.Token {
+	out := make(chan html.Token, 10)
+	go func() {
+		for notEnd := true; notEnd; {
+			mux.Lock()
+			tokenType := tokenizer.Next()
+			mux.Unlock()
+			switch tokenType {
+			case html.ErrorToken:
+				notEnd = false
+			case html.StartTagToken:
+				token := tokenizer.Token()
+				out <- token
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+func sendAttributes(in chan html.Token) chan html.Attribute {
+	out := make(chan html.Attribute, 10)
+	go func() {
+		for token := range in {
+			for _, attr := range token.Attr {
+				out <- attr
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+func filterAttributes(in chan html.Attribute, filterFn func(html.Attribute) bool) chan html.Attribute {
+	out := make(chan html.Attribute, 10)
+	go func() {
+		for attribute := range in {
+			if filterFn(attribute) {
+				out <- attribute
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+func filterTokens(in chan html.Token, filterFn func(html.Token) bool) chan html.Token {
+	out := make(chan html.Token, 10)
+	go func() {
+		for token := range in {
+			if filterFn(token) {
+				out <- token
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+func parseAttributes(body io.Reader, tag string, attribute string) chan string {
+	tokenizer := html.NewTokenizer(body)
+	tokenChan := sendTokens(tokenizer)
+	tagChan := filterTokens(tokenChan, func(t html.Token) bool {
+		return t.Data == tag
+	})
+	attributeChan := filterAttributes(sendAttributes(tagChan), func(a html.Attribute) bool {
+		if a.Key == attribute {
+			link, err := url.ParseRequestURI(a.Val)
+			if link == nil || err != nil {
+				return false
+			}
+			if link.Scheme != "" {
+				return true
+			}
+		}
+		return false
+	})
+	linkChan := make(chan string, 10)
+	go func() {
+		for attr := range attributeChan {
+			linkChan <- attr.Val
+		}
+		close(linkChan)
+	}()
+	return linkChan
+}
+
+func startParsing(body io.Reader, numJobs int) <-chan string {
+	var wg sync.WaitGroup
+	out := make(chan string, 10)
+	merge := func(in chan string) {
+		for i := range in {
+			out <- i
 		}
 		wg.Done()
 	}
-	wg.Add(len(chans))
-
-	for _, c := range chans {
-		go merge(c)
+	wg.Add(numJobs)
+	for i := 0; i < numJobs; i++ {
+		go merge(parseAttributes(body, "a", "href"))
 	}
 	go func() {
 		wg.Wait()
@@ -44,61 +132,8 @@ func mergeLinks(chans ...<-chan string) <-chan string {
 	return out
 }
 
-func parseLinks(attrChan chan html.Attribute) chan string {
-	linkChan := make(chan string, 10)
-	go func() {
-		for attr := range attrChan {
-			if attr.Key == "href" {
-				link, err := url.ParseRequestURI(attr.Val)
-				if link == nil || err != nil {
-					continue
-				}
-				if link.Scheme != "" {
-					linkChan <- link.String()
-				}
-			}
-		}
-		close(linkChan)
-	}()
-	return linkChan
-}
-
-func readAnchorTags(body io.Reader) chan html.Attribute {
-	out := make(chan html.Attribute, 10)
-	go func() {
-		tokenizer := html.NewTokenizer(body)
-		for notEnd := true; notEnd; {
-			currentTokenType := tokenizer.Next()
-			switch {
-			case currentTokenType == html.ErrorToken:
-				notEnd = false
-			case currentTokenType == html.StartTagToken:
-				token := tokenizer.Token()
-				if token.Data == "a" {
-					for _, attr := range token.Attr {
-						out <- attr
-					}
-				}
-			}
-		}
-		close(out)
-	}()
-	return out
-}
-
-func startParsing(body io.Reader, numJobs int) <-chan string {
-	anchorChan := readAnchorTags(body)
-	parsingJobs := make([]<-chan string, numJobs)
-	go func() {
-		for i := 0; i < numJobs; i-- {
-			parsingJobs[i] = parseLinks(anchorChan)
-		}
-	}()
-	return mergeLinks(parsingJobs...)
-}
-
 // GetLinks returns a map that contains the links as keys and their statuses as values
-func GetLinks(rootLink string) ([]Link, error) {
+func GetLinks(rootLink string) ([]LinkNode, error) {
 	// Creating new Tor connection
 	client := newDualClient(&ClientConfig{timeout: defaultTimeout})
 	resp, err := client.Get(rootLink)
@@ -107,7 +142,7 @@ func GetLinks(rootLink string) ([]Link, error) {
 	}
 	defer closer(resp.Body)
 	linkChan := startParsing(resp.Body, 16)
-	linkCollection := make([]Link, 0)
+	linkCollection := make([]LinkNode, 0)
 	for link := range startConverting(linkChan, client, 16) {
 		linkCollection = append(linkCollection, link)
 	}

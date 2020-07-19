@@ -2,47 +2,33 @@ package gobot
 
 import "sync"
 
-func mergeConverts(chans ...<-chan Link) <-chan Link {
+func startConverting(linkChan <-chan string, client *dualClient, numJobs int) chan LinkNode {
 	var wg sync.WaitGroup
-	out := make(chan Link)
-
-	merge := func(c <-chan Link) {
-		for link := range c {
-			out <- link
+	out := make(chan LinkNode, 10)
+	merge := func(in chan LinkNode) {
+		for i := range in {
+			out <- i
 		}
 		wg.Done()
 	}
-	wg.Add(len(chans))
-
-	for _, c := range chans {
-		go merge(c)
+	wg.Add(numJobs)
+	for i := 0; i < numJobs; i++ {
+		go merge(toLinkNode(linkChan, client))
 	}
-
 	go func() {
 		wg.Wait()
 		close(out)
 	}()
-
 	return out
 }
 
-func startConverting(linkChan <-chan string, client *dualClient, numJobs int) <-chan Link {
-	jobs := make([]<-chan Link, numJobs)
-	go func() {
-		for i := 0; i < numJobs; i++ {
-			jobs[i] = convertLinks(linkChan, client)
-		}
-	}()
-	return mergeConverts(jobs...)
-}
-
-func convertLinks(in <-chan string, client *dualClient) <-chan Link {
-	out := make(chan Link, 10)
+func toLinkNode(in <-chan string, client *dualClient) chan LinkNode {
+	out := make(chan LinkNode, 10)
 	go func() {
 		for link := range in {
 			resp, err := client.Head(link)
-			out <- Link{
-				Name:   link,
+			out <- LinkNode{
+				Link:   link,
 				Status: err == nil && resp.StatusCode < 400,
 			}
 		}
